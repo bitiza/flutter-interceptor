@@ -54,7 +54,10 @@ def run(a,to=120):
     except Exception as e:
         tlog("[!] cmd failed (%s): %s"%(e," ".join(str(x) for x in a[-4:]))); return "ERR %s"%e
 def adb(a,s=None,to=120): return run([ADB]+(["-s",s] if s else [])+a,to)
-def sush(c,s=None,to=120): return adb(["shell","su","-c",c],s,to)
+def sush(c,s=None,to=120):
+    # adb shell joins arguments again; pass the script on stdin so su receives
+    # the entire command, including spaces, pipes and redirections, on Nox too.
+    return sush_script(c,s,to)
 def sush_script(script,s=None,to=120):
     """Run a multi-line shell script as root by feeding it to `su -c sh` via stdin.
     Avoids the adb double-parse that mangles ';'/loops in `su -c '<script>'`."""
@@ -204,7 +207,8 @@ NATIVE_UNPIN_JS = r"""
 
 class Api:
     def __init__(self):
-        self.win=None; self.serial=None; self.uid=None; self.port=8080
+        # Keep the native window private: pywebview recursively inspects public API attributes.
+        self._win=None; self.serial=None; self.uid=None; self.port=8080
         self.session=None; self.dev=None; self.srv=None; self.running=False; self._stopping=False
         self._q=[]; self._qlock=threading.Lock(); self._alive=True
         # auto-recovery state
@@ -262,12 +266,12 @@ class Api:
             items=None
             with self._qlock:
                 if self._q: items=self._q; self._q=[]
-            if not items or not self.win: continue
+            if not items or not self._win: continue
             logbuf=[]
             def flush():
                 if logbuf:
                     for i in range(0,len(logbuf),200):
-                        try: self.win.evaluate_js("fiLogBatch(%s)"%json.dumps(logbuf[i:i+200]))
+                        try: self._win.evaluate_js("fiLogBatch(%s)"%json.dumps(logbuf[i:i+200]))
                         except Exception: pass
                     del logbuf[:]
             js_done=0; leftover=[]
@@ -276,7 +280,7 @@ class Api:
                     logbuf.append(payload)
                 elif js_done < self._JS_PER_TICK:
                     flush();
-                    try: self.win.evaluate_js(payload)
+                    try: self._win.evaluate_js(payload)
                     except Exception: pass
                     js_done+=1
                 else:
@@ -359,24 +363,27 @@ for p in $(pm list packages -3 | cut -d: -f2); do
 done
 wait'''
 
-    def scan(self,serial):
+    def scan(self,serial,all_apps=False):
         """Kick off the scan on a worker thread so the UI never blocks; results pushed via fiApps()."""
         self.serial=serial
-        threading.Thread(target=self._scan,args=(serial,),daemon=True).start()
+        threading.Thread(target=self._scan,args=(serial,bool(all_apps)),daemon=True).start()
         return {"ok":True}
 
-    def _scan(self,serial):
+    def _scan(self,serial,all_apps=False):
         found=[]
         try:
-            out=sush_script(self._SCAN_SH,serial)
+            out=adb(["shell","pm","list","packages"],serial,to=30) if all_apps else sush_script(self._SCAN_SH,serial)
             for l in out.splitlines():
                 pk=l.strip()
+                if all_apps:
+                    if not pk.startswith("package:"): continue
+                    pk=pk[len("package:"):]
                 if pk and "." in pk and " " not in pk:
-                    found.append({"pkg":pk,"name":pk.split('.')[-1].capitalize()})
+                    found.append({"pkg":pk,"name":pk.split('.')[-1].capitalize(),"flutter":not all_apps})
             found.sort(key=lambda x:x["pkg"])
         except Exception as e:
             self.log("[!] scan failed: %s"%e)
-        self._ui("fiApps(%s)"%json.dumps(found))
+        self._ui("fiApps(%s,%s,%s)"%(json.dumps(found),json.dumps(serial),json.dumps(all_apps)))
 
     # ---- real app icons (best-effort, async; cards already shown with letter fallback) ----
     def fetch_icons(self,serial,pkgs):
@@ -605,12 +612,23 @@ wait'''
         except Exception:
             return False
 
+    def _resolve_uid(self,pkg):
+        out=adb(["shell","pm","list","packages","-U",pkg],self.serial,to=15)
+        for line in out.splitlines():
+            fields=line.split()
+            if fields and fields[0]=="package:"+pkg:
+                for field in fields[1:]:
+                    if field.startswith("uid:") and field[4:].isdigit():
+                        return field[4:]
+        return None
+
     def _setup_routing(self,pkg):
         """One-time device prep: resolve uid, adb-reverse, route_localnet, iptables redirect."""
         s=self.serial
-        r=(sush("stat -c %%u /data/data/%s 2>/dev/null"%pkg,s) or "").strip().splitlines()
-        self.uid=r[0].strip() if r and r[0].strip().isdigit() else None
-        if not self.uid: self.log("[!] cannot resolve uid"); return False
+        self.uid=self._resolve_uid(pkg)
+        if not self.uid:
+            self.log("[!] cannot resolve uid for %s on %s via package manager"%(pkg,s)); return False
+        self._routing_context=(s,self.port)
         self.log("[*] app uid %s"%self.uid)
         adb(["reverse","tcp:%d"%self.port,"tcp:%d"%self.port],s)
         self.orig_rln=(sush("sysctl -n net.ipv4.conf.all.route_localnet 2>/dev/null",s) or "0").strip() or "0"
@@ -930,7 +948,7 @@ wait'''
         try:
             if self._mitm: self._mitm.stop(); self._mitm=None   # stop the in-tool capture proxy
         except Exception: pass
-        s=self.serial
+        s,route_port=getattr(self,"_routing_context",None) or (self.serial,self.port)
         try:
             # 1) detach frida (removes all in-app hooks; pinning restored automatically)
             try:
@@ -942,7 +960,7 @@ wait'''
                 if self.uid:
                     u=self.uid
                     for d in (443,80,8443):
-                        sush("iptables -t nat -D OUTPUT -p tcp --dport %d -m owner --uid-owner %s -j REDIRECT --to-ports %d 2>/dev/null"%(d,u,self.port),s,to=10)
+                        sush("iptables -t nat -D OUTPUT -p tcp --dport %d -m owner --uid-owner %s -j REDIRECT --to-ports %d 2>/dev/null"%(d,u,route_port),s,to=10)
                     for d in (443,80):
                         sush("iptables -D OUTPUT -p udp --dport %d -m owner --uid-owner %s -j REJECT 2>/dev/null"%(d,u),s,to=10)
                     for proto in ("tcp","udp"):
@@ -951,11 +969,11 @@ wait'''
                 # 3) belt-and-suspenders: delete ANY leftover redirect-to-our-port rules
                 for _ in range(8):
                     out=sush("iptables -t nat -S OUTPUT 2>/dev/null",s,to=10)
-                    line=next((l for l in out.splitlines() if ("--to-ports %d"%self.port) in l and l.startswith("-A ")), None)
+                    line=next((l for l in out.splitlines() if ("--to-ports %d"%route_port) in l and l.startswith("-A ")), None)
                     if not line: break
                     sush("iptables -t nat -D"+line[2:],s,to=10)
                 # 4) clear the adb-reverse tunnel (and the stealth adb-forward, if any)
-                adb(["reverse","--remove","tcp:%d"%self.port],s,to=10)
+                adb(["reverse","--remove","tcp:%d"%route_port],s,to=10)
                 adb(["forward","--remove","tcp:%d"%self._stealth_port],s,to=10)
                 # 5) restore route_localnet to its original value
                 if getattr(self,"orig_rln",None) is not None:
@@ -965,6 +983,7 @@ wait'''
                     if self.srv: self.srv.terminate()
                 except Exception as e: tlog("[!] srv.terminate: %s"%e)
                 sush("pkill -9 -f frida-server 2>/dev/null; pkill -9 -f %s 2>/dev/null"%self._stealth_name,s,to=10)
+            self._routing_context=None
             self.uid=None; self.srv=None
             self.log("[+] stopped — device restored to normal (hooks removed, iptables cleared, reverse removed, route_localnet restored, frida-server stopped)")
             self.status("idle","Stopped — device restored to normal.")
@@ -985,7 +1004,7 @@ def main():
     html=res(os.path.join("webui","index.html"))
     if not os.path.isfile(html): html=os.path.join(HERE,"webui","index.html")
     win=webview.create_window("Flutter Interceptor", html, js_api=api, width=1120, height=760, min_size=(960,660), background_color="#0f1115")
-    api.win=win
+    api._win=win
     # batched log flusher (keeps a chatty frida script from flooding/freezing the WebView)
     threading.Thread(target=api._pump,daemon=True).start()
     # on window close / abort -> restore the device to normal (bounded by short timeouts)

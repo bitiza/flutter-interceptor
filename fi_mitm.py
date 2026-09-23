@@ -8,7 +8,7 @@ request/response to a callback for the tool's Requests tab.
 
 Works for ANY app (Flutter/Dart, Cronet, OkHttp, native) with no per-version byte patterns.
 """
-import os, ssl, socket, threading, datetime, ipaddress, gzip, zlib, select
+import os, ssl, socket, threading, datetime, ipaddress, gzip, zlib, select, uuid
 try:
     import brotli as _brotli            # optional: pip install brotli — for br-encoded bodies
 except Exception:
@@ -386,6 +386,7 @@ class MitmProxy:
             client_sock.sendall(s_conn.data_to_send())
             up_sock.sendall(c_conn.data_to_send())
             # stream map: app_stream_id -> upstream_stream_id (and reverse for routing responses)
+            captures = {"connection": uuid.uuid4().hex}
             fwd = {}     # app_id -> up_id
             rev = {}     # up_id   -> app_id
             client_sock.settimeout(None); up_sock.settimeout(None)
@@ -419,7 +420,7 @@ class MitmProxy:
                         break
                     for ev in evs:
                         try:
-                            self._h2_handle_event(ev, s_conn, c_conn, client_sock, up_sock, fwd, rev, host, upside)
+                            self._h2_handle_event(ev, s_conn, c_conn, client_sock, up_sock, fwd, rev, host, upside, captures)
                         except Exception:
                             if self._debug: self.log("[mitm-h2] event err: %s" % ev)
                 # flush any pending frames
@@ -436,7 +437,7 @@ class MitmProxy:
                 try: s.close()
                 except Exception: pass
 
-    def _h2_handle_event(self, ev, s_conn, c_conn, client_sock, up_sock, fwd, rev, host, upside):
+    def _h2_handle_event(self, ev, s_conn, c_conn, client_sock, up_sock, fwd, rev, host, upside, captures):
         # upside=False => event came from the APP side (request);  True => from the UPSTREAM side (response)
         if upside:
             # ---- upstream -> app (response / trailers / response-data) ----
@@ -444,19 +445,13 @@ class MitmProxy:
             appid = rev.get(sid)
             if isinstance(ev, (h2.events.ResponseReceived, h2.events.TrailersReceived)):
                 if appid is None: return
-                # capture the response headers / trailers so bodyless responses (e.g. gRPC status-only)
-                # still appear in the Requests tab
-                if isinstance(ev, h2.events.ResponseReceived):
-                    status = next((v for k, v in ev.headers if k == ":status"), "")
-                    self.on_event({"dir": "in", "method": "RESP", "url": "%s [h2 stream %d]" % (host, appid),
-                                   "first": "HTTP/2 %s" % status, "data": "h2 response %s {trailer: grpc} %s" % (status, host),
-                                   "host": host})
+                self._capture_h2(captures, appid, "in", host, ev)
                 s_conn.send_headers(appid, list(ev.headers), end_stream=ev.stream_ended)
             elif isinstance(ev, h2.events.DataReceived):
                 if appid is None:
                     c_conn.acknowledge_received_data(ev.flow_controlled_length, sid); return
                 if ev.data:
-                    self._emit_h2("in", host, appid, None, ev.data[:4_000_000])
+                    self._capture_h2(captures, appid, "in", host, ev)
                     s_conn.send_data(appid, ev.data[:4_000_000])
                 c_conn.acknowledge_received_data(ev.flow_controlled_length, sid)
                 if ev.stream_ended: s_conn.end_stream(appid)
@@ -470,13 +465,14 @@ class MitmProxy:
             if isinstance(ev, h2.events.RequestReceived):
                 upid = c_conn.get_next_available_stream_id()
                 fwd[sid] = upid; rev[upid] = sid
+                self._capture_h2(captures, sid, "out", host, ev)
                 c_conn.send_headers(upid, list(ev.headers), end_stream=ev.stream_ended)
             elif isinstance(ev, h2.events.DataReceived):
                 upid = fwd.get(sid)
                 if upid is None:
                     s_conn.acknowledge_received_data(ev.flow_controlled_length, sid); return
                 if ev.data:
-                    self._emit_h2("out", host, sid, None, ev.data[:4_000_000])
+                    self._capture_h2(captures, sid, "out", host, ev)
                     c_conn.send_data(upid, ev.data[:4_000_000])
                 s_conn.acknowledge_received_data(ev.flow_controlled_length, sid)
                 if ev.stream_ended: c_conn.end_stream(upid)
@@ -485,22 +481,49 @@ class MitmProxy:
                 if upid is not None:
                     try: c_conn.reset_stream(upid, getattr(ev, "error_code", 0))
                     except Exception: pass
+        if isinstance(ev, (h2.events.StreamEnded, h2.events.StreamReset)):
+            appid = rev.get(sid) if upside else sid
+            if upside or isinstance(ev, h2.events.StreamReset):
+                captures.pop((appid, "in"), None)
+                captures.pop((appid, "out"), None)
         # settings / window / ping events are handled internally by the h2 connection objects
 
-    def _emit_h2(self, direction, host, stream_id, headers_text, body):
-        """Emit an h2 stream chunk to the Requests tab as a readable entry."""
-        try:
-            # for gRPC, body is protobuf (binary) — show a hex-ish preview, not garbled utf-8
-            if body and len(body) > 2 and body[:1] in (b"\x00", b"\x01") and direction == "out":
-                text = "gRPC frame (grpc): " + body[:200].hex()
-            else:
-                text = (headers_text or "") + ("\n" + body.decode("utf-8", "replace") if body else "")
-            self.on_event({"dir": direction, "method": "GRPC" if direction == "out" else "RESP",
-                           "url": "%s [h2 stream %d]" % (host, stream_id),
-                           "first": "%s h2/%d" % (direction, stream_id),
-                           "data": text[:4000], "host": host})
-        except Exception:
-            pass
+    def _capture_h2(self, captures, sid, direction, host, ev):
+        """Retain bounded previews per stream; capture never changes forwarded bytes."""
+        state=captures.setdefault((sid,direction), {"headers":[],"trailers":[],"body":bytearray(),"size":0})
+        if isinstance(ev,h2.events.TrailersReceived):
+            state["trailers"]=list(ev.headers)
+        elif hasattr(ev,"headers"):
+            state["headers"]=list(ev.headers)
+        if isinstance(ev,h2.events.DataReceived):
+            state["size"]+=len(ev.data)
+            state["body"].extend(ev.data[:max(0,65536-len(state["body"]))])
+        req=captures.get((sid,"out"),{})
+        request_headers=dict(req.get("headers",[]))
+        headers=dict(state["headers"])
+        url="https://"+request_headers.get(":authority",host)+request_headers.get(":path","/")
+        status=headers.get(":status","")
+        method=request_headers.get(":method","?") if direction=="out" else "RESP"
+        first=(method+" "+request_headers.get(":path","/")+" HTTP/2") if direction=="out" else "HTTP/2 "+status
+        body=bytes(state["body"])
+        content_type=headers.get("content-type","")
+        encoding=headers.get("content-encoding","")
+        binary="grpc" in content_type or "protobuf" in content_type or encoding not in ("","identity")
+        if not binary:
+            try: body_text=body.decode("utf-8")
+            except UnicodeDecodeError: binary=True
+        if binary: body_text="Binary body (hex; %s)\n"%(content_type or encoding or "unknown type")+body.hex(" ")
+        if not body: body_text=""
+        truncated=state["size"]>len(body)
+        header_text="\n".join(k+": "+v for k,v in state["headers"])
+        trailer_text="\n".join(k+": "+v for k,v in state["trailers"])
+        raw=first+"\n"+header_text+"\n\n"+body_text
+        if truncated: raw+="\n[preview truncated at 65536 bytes]"
+        if trailer_text: raw+="\n\nTrailers:\n"+trailer_text
+        self.on_event({"id":captures["connection"]+":"+str(sid)+":"+direction,
+                       "dir":direction,"method":method,"url":url,"first":first,"data":raw,
+                       "headers":header_text,"trailers":trailer_text,"body":body_text,
+                       "status":status,"size":state["size"],"truncated":truncated,"host":host})
 
     def _h2_close(self, s_conn, c_conn, client_sock, up_sock, fwd, rev):
         try:

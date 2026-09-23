@@ -258,7 +258,7 @@
     <!-- INTERCEPT -->
     <div class="view on" data-view="intercept">
       <div class="head">
-        <div><h1>Intercept a Flutter app</h1>
+        <div><h1>Intercept an Android app</h1>
           <div class="sub">Pick an app — it provisions frida, unpins TLS, and routes traffic to your proxy. One click.</div></div>
       </div>
 
@@ -291,12 +291,13 @@
       </div>
 
       <div class="gridhead">
-        <span class="count" id="count"><b>0</b> Flutter apps</span>
+        <span class="count" id="count"><b>0</b> apps</span>
+        <select id="appScope" aria-label="App list" onchange="scanApps()"><option value="all">All installed apps</option><option value="flutter">Flutter apps only</option></select>
         <span class="grow"></span>
         <div class="search"><span class="si">⌕</span><input id="filter" placeholder="Filter apps…" oninput="renderCards()"></div>
       </div>
       <div class="cards" id="cards">
-        <div class="empty"><div class="big">⬡</div><b>Connect a rooted device</b>Then hit ↻ to scan for Flutter apps.</div>
+        <div class="empty"><div class="big">⬡</div><b>Connect a rooted device</b>Then hit ↻ to scan for apps.</div>
       </div>
     </div>
 
@@ -480,7 +481,7 @@
     if(!devs||!devs.length){
       $('rootPill').textContent='no device';$('rootPill').className='pill bad';
       $('cards').innerHTML='<div class="empty"><div class="big">⬡</div><b>No device found</b>Connect a rooted device over adb, then hit ↻.</div>';
-      $('count').innerHTML='<b>0</b> Flutter apps';return;
+      $('count').innerHTML='<b>0</b> apps';return;
     }
     devs.forEach(d=>{var o=document.createElement('option');o.value=d.serial;
       o.textContent=d.serial+(d.root?'   ✓ root':'   ✗ no root');o.dataset.root=d.root;sel.appendChild(o);});
@@ -488,25 +489,29 @@
   };
   function updateRoot(){var o=$('dev').selectedOptions[0];var r=o&&o.dataset.root==='true';
     var p=$('rootPill');p.textContent=r?'✓ root':'✗ no root';p.className='pill '+(r?'ok':'bad');}
+  function allApps(){return $('appScope').value==='all';}
   function scanApps(){
+    if(!READY||!$('dev').value)return;
+    APPS=[];
     updateRoot(); ICONS={};
-    $('cards').innerHTML='<div class="empty"><div class="big">⟳</div><b>Scanning…</b>Looking for libflutter.so in installed apps.</div>';
+    $('cards').innerHTML='<div class="empty"><div class="big">⟳</div><b>Scanning…</b>'+(allApps()?'Listing installed Android packages.':'Looking for libflutter.so in installed apps.')+'</div>';
     $('count').innerHTML='scanning…';
-    window.pywebview.api.scan($('dev').value); /* fire-and-forget — results arrive via fiApps() */
+    window.pywebview.api.scan($('dev').value,allApps()); /* fire-and-forget — results arrive via fiApps() */
   }
-  window.fiApps=function(apps){
+  window.fiApps=function(apps,serial,all){
+    if(serial!==$('dev').value || all!==allApps())return;
     APPS=apps||[]; renderCards();
     try{ if(window.pywebview&&APPS.length) window.pywebview.api.fetch_icons($('dev').value, APPS.map(function(a){return a.pkg;})); }catch(e){}
   };
   function renderCards(){
     var f=$('filter').value.toLowerCase(), c=$('cards');
     var items=APPS.filter(a=>a.pkg.toLowerCase().includes(f)||(a.name||'').toLowerCase().includes(f));
-    $('count').innerHTML='<b>'+items.length+'</b> Flutter app'+(items.length===1?'':'s')+(f?' (filtered)':'');
+    $('count').innerHTML='<b>'+items.length+'</b> '+(allApps()?'app':'Flutter app')+(items.length===1?'':'s')+(f?' (filtered)':'');
     c.innerHTML='';
     if(!items.length){
       c.innerHTML='<div class="empty"><div class="big">'+(APPS.length?'⌕':'⬡')+'</div><b>'+
-        (APPS.length?'No matches':'No Flutter apps found')+'</b>'+
-        (APPS.length?'Nothing matches “'+f+'”.':'Scan a device with Flutter apps installed.')+'</div>';return;
+        (APPS.length?'No matches':(allApps()?'No installed apps found':'No Flutter apps found'))+'</b>'+
+        (APPS.length?'Nothing matches “'+f+'”.':(allApps()?'Refresh to scan the connected device.':'Try All installed apps to include native Android apps.'))+'</div>';return;
     }
     items.forEach(a=>{
       var d=document.createElement('div');d.className='card';d.dataset.pkg=a.pkg;
@@ -515,9 +520,9 @@
         : '<div class="av" style="'+avStyle(a.pkg)+'">'+(a.name||a.pkg).slice(0,1).toUpperCase()+'</div>';
       d.innerHTML=av+
         '<div class="body"><h3>'+(a.name||a.pkg.split('.').pop())+'</h3><p>'+a.pkg+'</p>'+
-        '<div class="chips"><span class="chip fl">FLUTTER</span>'+(a.size?'<span class="chip sz">'+a.size+'</span>':'')+'</div></div>'+
+        '<div class="chips"><span class="chip fl">'+(a.flutter?'FLUTTER':'ANDROID')+'</span>'+(a.size?'<span class="chip sz">'+a.size+'</span>':'')+'</div></div>'+
         '<span class="go">▶</span>'+
-        '<button class="buildbtn" title="Root-free: build a patched &amp; signed APK that sends traffic to Burp (reFlutter). No root needed.">🔧 Build patched</button>';
+        (a.flutter?'<button class="buildbtn" title="Root-free: build a patched &amp; signed APK that sends traffic to Burp (reFlutter). No root needed.">🔧 Build patched</button>':'');
       d.onclick=()=>startIntercept(a.pkg,a.name||a.pkg);
       var bb=d.querySelector('.buildbtn');
       if(bb) bb.onclick=function(ev){ ev.stopPropagation(); buildReflutter(a.pkg,a.name||a.pkg,bb); };
@@ -585,7 +590,10 @@
   function shortTime(){ var d=new Date(); return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2); }
   window.fiReq=function(obj){
     if(!obj || REQ_PAUSE) return;
-    obj.t=shortTime(); REQS.push(obj); if(REQS.length>1000) REQS.shift();
+    var existing=obj.id?REQS.findIndex(r=>r.id===obj.id):-1;
+    if(existing>=0){obj.t=REQS[existing].t; REQS[existing]=obj;}
+    else{obj.t=shortTime(); REQS.push(obj); if(REQS.length>1000){REQS.shift(); REQ_SEL--;}}
+    if(REQ_SEL>=0)showReq(REQ_SEL);
     $('reqBadge').textContent=REQS.length; renderReqs();
   };
   function reqMethod(r){ return (r.method||(r.dir==='in'?'RESP':'?')).toUpperCase(); }
@@ -600,7 +608,8 @@
     items.reverse().forEach(function(o){
       var r=o.r, idx=o.i, m=reqMethod(r);
       var row=document.createElement('div'); row.className='reqrow'+(idx===REQ_SEL?' sel':'');
-      row.innerHTML='<span class="m '+m+'">'+m+'</span><span class="u">'+(r.url||r.first||'')+'</span><span class="tm">'+r.t+'</span>';
+      row.innerHTML='<span class="m '+m+'">'+m+'</span><span class="u">'+''+'</span><span class="tm">'+r.t+'</span>';
+      row.querySelector('.u').textContent=(r.status?r.status+' ':'')+(r.url||r.first||'');
       row.onclick=function(){ showReq(idx,row); };
       l.appendChild(row);
     });
@@ -613,11 +622,26 @@
     try{ var t=body.trim(); if((t[0]==='{'||t[0]==='[')){ body=JSON.stringify(JSON.parse(t),null,2); } }catch(e){}
     return head?(head+'\n\n'+body):body;
   }
+  var REQ_VIEW='raw';
   function showReq(idx,row){
     REQ_SEL=idx;
     document.querySelectorAll('.reqrow.sel').forEach(x=>x.classList.remove('sel')); if(row)row.classList.add('sel');
     var r=REQS[idx]; var d=$('reqdetail'); d.classList.add('on');
-    d.textContent=(r.method?(r.method+' '+(r.url||'')+'\n\n'):'')+prettyBody(r.data||r.first||'');
+    d.replaceChildren();
+    if(r.headers!==undefined){
+      var toolbar=document.createElement('div'); toolbar.style.cssText='display:flex;gap:8px;margin-bottom:10px';
+      ['raw','headers','body','trailers'].forEach(function(view){
+        var btn=document.createElement('button'); btn.className='btn ghost';
+        btn.textContent=view[0].toUpperCase()+view.slice(1)+(REQ_VIEW===view?' ✓':'');
+        btn.onclick=function(){REQ_VIEW=view;showReq(idx);};toolbar.appendChild(btn);
+      });d.appendChild(toolbar);
+    }
+    var content=document.createElement('pre');content.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:inherit';
+    var text=r.data||r.first||'';
+    if(r.headers!==undefined && REQ_VIEW!=='raw')text=r[REQ_VIEW]||'(none captured)';
+    content.textContent=REQ_VIEW==='body'?prettyBody(text):text;
+    if(r.truncated && REQ_VIEW==='body')content.textContent+='\n[preview truncated at 65536 bytes]';
+    d.appendChild(content);
   }
   function copyReq(){
     if(REQ_SEL<0||!REQS[REQ_SEL]){ toast('Select a request first','bad'); return; }
