@@ -211,6 +211,7 @@ class Api:
         self._win=None; self.serial=None; self.uid=None; self.port=8080
         self.session=None; self.dev=None; self.srv=None; self.running=False; self._stopping=False
         self._q=[]; self._qlock=threading.Lock(); self._alive=True
+        self._start_lock=threading.Lock(); self._cancel_start=threading.Event()
         # auto-recovery state
         self.want_running=False   # user intends interception to stay up
         self.cur_pkg=None; self.opts={}; self.auto_recover=True; self._recovering=False; self._afsc=None
@@ -219,6 +220,7 @@ class Api:
         self._stealth_name="memtrackd"; self._stealth_port=47823; self._fdev=None
         self.diag=None; self._strat=0     # diagnostics report + adaptive-launch escalation index
         self._launch_delay=0; self._ensured_stealth=None; self._ssl_hooked=False; self._mitm=None; self._mitm_ca_name=None
+        self._ca_overlay=None
 
     # ---- unified UI dispatch ----
     # ALL UI updates (logs, status, device/app/icon pushes) are queued here and executed by a
@@ -413,6 +415,9 @@ wait'''
     # NOTE: this js_api method must return FAST so the GUI thread never blocks.
     # All device I/O (teardown of a prior run, root check, frida, routing) happens in _run.
     def start(self,serial,pkg,ssl,root,vpn,port,mode,antifrida=False,stealth=False,mitmcap=False):
+        if self._stopping or not self._start_lock.acquire(blocking=False):
+            return {"ok":False,"err":"Startup or cleanup is still in progress; wait for it to finish."}
+        self._cancel_start.clear()
         self.serial=serial; self.port=int(port or 8080)
         self.opts={"ssl":bool(ssl),"root":bool(root),"vpn":bool(vpn),"mode":mode or "spawn",
                    "antifrida":bool(antifrida),"stealth":bool(stealth),"mitmcap":bool(mitmcap),
@@ -478,8 +483,7 @@ wait'''
             self._mitm=None
 
     def _install_mitm_ca(self):
-        """Install the MITM CA into the device system trust store (rooted) so ALL TLS stacks
-        (Cronet/Conscrypt/OkHttp/Flutter) accept our cert — the key to universal capture."""
+        """Attempt system CA installation and verify the copy; read-only stores may reject it."""
         ca=self._mitm.ca_path() if self._mitm else None
         if not ca or not os.path.isfile(ca): return
         try:
@@ -494,14 +498,109 @@ wait'''
                 "for D in /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts; do\n"
                 "  [ -d \"$D\" ] && cp /data/local/tmp/fi_ca.pem $D/%s 2>/dev/null && chmod 644 $D/%s 2>/dev/null\n"
                 "  [ -n \"$CTX\" ] && chcon $CTX $D/%s 2>/dev/null\n"
-                "done\n"%(name,name,name))
-        sush_script(script,s,to=20)
+                "  cmp -s /data/local/tmp/fi_ca.pem $D/%s && echo FI_CA_OK:$D\n"
+                "done\n"%(name,name,name,name))
+        result=sush_script(script,s,to=20)
+        if "FI_CA_OK:" not in result:
+            self._mitm_ca_name=name
+            self.log("[*] System trust stores are read-only; will try a temporary CA overlay in the target app's mount namespace.")
+            return False
         self._mitm_ca_name=name
-        self.log("[+] MITM CA installed in device trust store (%s) — all TLS stacks now trust the proxy"%name)
+        self.log("[+] Proxy CA copy verified in device trust store (%s); app trust and certificate pinning still depend on its TLS implementation"%name)
+        return True
+
+    def _install_app_ca(self,pid):
+        """Bind preserved trust anchors plus our CA into only the target app namespace."""
+        if not self._mitm or not self._mitm_ca_name: return
+        self._remove_app_ca()
+        name=self._mitm_ca_name
+        folder="/data/local/tmp/fi-cacerts-"+os.urandom(8).hex()
+        script=r'''set -e
+P=%d
+N=$(readlink /proc/$P/ns/mnt)
+for Z in $(pidof zygote zygote64); do
+  [ "$N" != "$(readlink /proc/$Z/ns/mnt)" ] || { echo FI_CA_SHARED_NAMESPACE; exit 1; }
+done
+D=/apex/com.android.conscrypt/cacerts
+[ -d /proc/$P/root$D ] || D=/system/etc/security/cacerts
+cmp -s /data/local/tmp/fi_ca.pem /proc/$P/root$D/%s && { echo FI_CA_ALREADY_PRESENT; exit 0; }
+S=%s
+mkdir -m 755 "$S"
+cp /proc/$P/root$D/* "$S/"
+cp /data/local/tmp/fi_ca.pem "$S/%s"
+chmod 644 "$S"/*
+set -- $(ls -Zd /proc/$P/root$D)
+CTX=$1
+case "$CTX" in u:object_r:*) ;; *) echo FI_CA_CONTEXT_UNKNOWN; exit 1;; esac
+chcon "$CTX" "$S" "$S"/*
+nsenter --mount=/proc/$P/ns/mnt -- mount --bind "$S" "$D"
+echo FI_CA_MOUNT:$D:$N
+cmp -s /data/local/tmp/fi_ca.pem /proc/$P/root$D/%s && echo FI_CA_APP_OK
+'''%(int(pid),name,folder,name,name)
+        result=sush_script(script,self.serial,to=15)
+        marker=next((l for l in result.splitlines() if l.startswith("FI_CA_MOUNT:")),None)
+        if marker:
+            path,namespace=marker[len("FI_CA_MOUNT:"):].split(":",1)
+            self._ca_overlay=(self.serial,int(pid),path,namespace,name)
+        if "FI_CA_APP_OK" in result or "FI_CA_ALREADY_PRESENT" in result:
+            self.log("[+] Proxy CA verified inside target app trust store (temporary overlay; removed on Stop). Certificate pinning may still require hooks.")
+            return True
+        self._remove_app_ca()
+        self.log("[!] Target app CA overlay failed; HTTPS may fail certificate validation.")
+        return False
+
+    def _remove_app_ca(self):
+        overlay=self._ca_overlay
+        if not overlay: return
+        serial,pid,path,namespace,name=overlay
+        script=('if [ "$(readlink /proc/%d/ns/mnt)" = "%s" ] && '
+                'cmp -s /data/local/tmp/fi_ca.pem /proc/%d/root%s/%s; then\n'
+                'nsenter --mount=/proc/%d/ns/mnt -- umount %s && echo FI_CA_REMOVED\n'
+                'else echo FI_CA_PROCESS_GONE; fi\n')%(pid,namespace,pid,path,name,pid,path)
+        result=sush_script(script,serial,to=10)
+        if "FI_CA_REMOVED" in result or "FI_CA_PROCESS_GONE" in result:
+            self._ca_overlay=None
+        else:
+            self.log("[!] Could not remove app CA overlay; close the target app to discard its mount namespace.")
 
     def _mitm_event(self,ev):
         try: self._ui("fiReq(%s)"%json.dumps(ev))
         except Exception: pass
+
+    def _device_ready(self,serial):
+        state=adb(["get-state"],serial,to=5).strip()
+        if state=="device": return True
+        self.log("[!] ADB connection to %s is unavailable; reconnect the emulator before retrying (this is not a root check failure)."%serial)
+        return False
+
+    def _download_frida(self,version,canon,local):
+        """Bound the entire download; keep incomplete files out of the reusable cache."""
+        url="https://github.com/frida/frida/releases/download/%s/%s.xz"%(version,canon)
+        self.log("[*] downloading %s from GitHub (first use for this version/architecture)"%canon)
+        started=time.monotonic(); last=started; chunks=[]; received=0
+        with urllib.request.urlopen(url,timeout=15) as response:
+            total=int(response.headers.get("Content-Length",0))
+            while True:
+                if time.monotonic()-started>900:
+                    raise TimeoutError("download exceeded 15 minutes; retry or check the GitHub connection")
+                chunk=response.read1(256*1024)
+                if not chunk: break
+                chunks.append(chunk); received+=len(chunk)
+                if time.monotonic()-last>=2:
+                    suffix=" / %.1f MB"%(total/1048576) if total else ""
+                    self.log("[*] downloaded %.1f MB%s"%(received/1048576,suffix)); last=time.monotonic()
+        self.log("[*] decompressing frida-server…")
+        binary=lzma.decompress(b"".join(chunks))
+        if not binary.startswith(b"\x7fELF"):
+            raise ValueError("download did not contain an ELF executable")
+        temporary=None
+        try:
+            with tempfile.NamedTemporaryFile(dir=os.path.dirname(local),delete=False) as output:
+                temporary=output.name; output.write(binary)
+            os.replace(temporary,local); temporary=None
+        finally:
+            if temporary: os.unlink(temporary)
+        self.log("[+] downloaded and cached matching frida-server")
 
     def ensure_frida(self,s):
         load_frida()   # lazy import (kept out of startup so the UI opens fast)
@@ -513,10 +612,15 @@ wait'''
             local=os.path.join(tempfile.gettempdir(),canon)
             if not os.path.isfile(local):
                 try:
-                    raw=urllib.request.urlopen("https://github.com/frida/frida/releases/download/%s/%s.xz"%(hv,canon),timeout=120).read()
-                    open(local,"wb").write(lzma.decompress(raw)); self.log("[+] downloaded matching frida-server")
+                    self._download_frida(hv,canon,local)
                 except Exception as e: self.log("[!] fetch frida-server failed: %s"%e); return False
+            else:
+                self.log("[*] using cached frida-server: %s"%local)
+            if self._cancel_start.is_set(): return False
+            if not self._device_ready(s): return False
+            self.log("[*] copying frida-server to device…")
             adb(["push",local,cdp],s)
+        if self._cancel_start.is_set() or not self._device_ready(s): return False
         sush("chmod 755 %s"%cdp,s)
         # 2) stealth: run a RENAMED copy on a non-standard port so the app can't detect frida-server
         #    by its process name ("frida-server") or default port (27042).
@@ -533,8 +637,10 @@ wait'''
             dp=cdp; launch=dp
         # 3) kill any prior servers (canonical + stealth) then start ours host-detached (stays root)
         sush("pkill -9 -f frida-server 2>/dev/null; pkill -9 -f %s 2>/dev/null; pkill -9 -f re.frida 2>/dev/null"%self._stealth_name,s); time.sleep(1)
-        self.srv=subprocess.Popen([ADB,"-s",s,"shell","su","-c",launch],creationflags=NW,
-                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL)
+        self.srv=subprocess.Popen([ADB,"-s",s,"shell","su","-c","sh"],creationflags=NW,
+                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,stdin=subprocess.PIPE)
+        self.srv.stdin.write(("exec "+launch+"\n").encode("utf-8"))
+        self.srv.stdin.close()
         # connect: stealth uses adb-forward + remote device (a custom port can't spawn over USB);
         # non-stealth uses the normal USB device.
         self._fdev=None
@@ -542,15 +648,17 @@ wait'''
             time.sleep(2); adb(["forward","tcp:%d"%port,"tcp:%d"%port],s)
             try: self._fdev=frida.get_device_manager().add_remote_device("127.0.0.1:%d"%port)
             except Exception as e: tlog("[!] remote device add: %s"%e)
+        last_error="unknown"
         for _ in range(12):
-            time.sleep(1)
+            if self._cancel_start.wait(1): return False
             try:
-                d=self._fdev or frida.get_usb_device(timeout=4)
+                d=self._fdev or frida.get_device(s,timeout=4)
                 d.enumerate_processes(); self._fdev=d
                 self._ensured_stealth=stealth
                 self.log("[+] frida-server %s running (root%s)"%(hv," · stealth" if stealth else "")); return True
-            except Exception: pass
-        self.log("[!] frida-server did not come up"); return False
+            except Exception as e: last_error=str(e)
+            if not self._device_ready(s): return False
+        self.log("[!] frida-server did not come up on %s: %s"%(s,last_error)); return False
 
     def _handle_diag(self,raw):
         """Receive the engine's FIDIAG detection report, enrich it (proxy/traffic/fixes), push to UI."""
@@ -630,7 +738,7 @@ wait'''
             self.log("[!] cannot resolve uid for %s on %s via package manager"%(pkg,s)); return False
         self._routing_context=(s,self.port)
         self.log("[*] app uid %s"%self.uid)
-        adb(["reverse","tcp:%d"%self.port,"tcp:%d"%self.port],s)
+        adb(["reverse","tcp:%d"%self.port,"tcp:%d"%self.port],s,to=10)
         self.orig_rln=(sush("sysctl -n net.ipv4.conf.all.route_localnet 2>/dev/null",s) or "0").strip() or "0"
         sush("sysctl -w net.ipv4.conf.all.route_localnet=1 2>/dev/null || echo 1 > /proc/sys/net/ipv4/conf/all/route_localnet 2>/dev/null",s)
         u=self.uid
@@ -677,27 +785,33 @@ wait'''
                 self.log("    (3) make sure Burp has an INVISIBLE proxy listener on :%d"%self.port)
                 self.log("    (4) if still 0, the app may use a VPN/DNS path the redirect can't see — tell me and I'll add a full-tunnel mode")
 
+    def _app_pid(self,pkg):
+        # Frida may report the display name (e.g. GeoPoll) instead of the
+        # Android package name. pidof looks up the actual process name.
+        output=adb(["shell","pidof",pkg],self.serial,to=5).strip().split()
+        return next((int(pid) for pid in output if pid.isdigit()),None)
+
     def _launch_and_get_pid(self,dev,pkg):
         """Launch the app normally (monkey) and wait for its process — used for attach."""
         s=self.serial
         adb(["shell","monkey","-p",pkg,"-c","android.intent.category.LAUNCHER","1"],s)
         deadline=time.time()+15
         while time.time()<deadline:
-            ps=[p for p in dev.enumerate_processes() if pkg in (p.name or "")]
-            if ps: return ps[0].pid
+            pid=self._app_pid(pkg)
+            if pid: return pid
+            if self._cancel_start.is_set(): return None
             time.sleep(0.5)
         return None
 
     def _inject(self,pkg,force_spawn=False):
         """(Re)spawn/attach the app and load the patch engine. Reusable for crash recovery."""
         s=self.serial
-        dev=self._fdev or frida.get_usb_device(timeout=20)
+        dev=self._fdev or frida.get_device(self.serial,timeout=20)
         self.dev=dev; resume=False
         # stealth (remote-device) can't suspend-spawn reliably; and 'attach' mode is explicit.
         want_attach = self.opts.get("stealth") or (self.opts.get("mode")=="attach" and not force_spawn)
         if want_attach:
-            ps=[p for p in dev.enumerate_processes() if pkg in (p.name or "")]
-            pid=ps[0].pid if ps else self._launch_and_get_pid(dev,pkg)
+            pid=self._app_pid(pkg) or self._launch_and_get_pid(dev,pkg)
             if not pid: self.log("[!] app did not start (for attach)"); return False
             # delayed-attach strategy: let the app pass more of its startup checks before we attach
             if self._launch_delay>0:
@@ -713,7 +827,29 @@ wait'''
                 pid=self._launch_and_get_pid(dev,pkg)
                 if not pid: self.log("[!] app did not start for attach"); return False
                 resume=False
-        self.session=dev.attach(pid); self.log("[*] target pid %d"%pid)
+        if self.opts.get("mitmcap"): self._install_app_ca(pid)
+        try:
+            self.session=dev.attach(pid)
+        except frida.ProcessNotFoundError:
+            # Retry only if Android reports a different, live startup process.
+            replacement=self._app_pid(pkg) if not resume else None
+            if replacement and replacement!=pid:
+                self.log("[*] app process changed %d → %d; attaching to replacement"%(pid,replacement))
+                pid=replacement
+                if self.opts.get("mitmcap"): self._install_app_ca(pid)
+                self.session=dev.attach(pid)
+            else:
+                if resume:
+                    try: dev.resume(pid)
+                    except Exception: pass
+                raise RuntimeError("%s exited before Frida could attach. Stop interception and confirm the app opens normally, then use Attach mode."%pkg)
+        except Exception:
+            # A failed attach must not leave a spawn suspended indefinitely.
+            if resume:
+                try: dev.resume(pid)
+                except Exception: pass
+            raise
+        self.log("[*] target pid %d"%pid)
         self.session.on('detached', self._on_detached)  # detect app close/crash
         optsjs="globalThis.FI_OPTS=%s;\n"%json.dumps({k:self.opts[k] for k in ("ssl","root","vpn")})
         optsjs+="globalThis.FI_EXPERIMENTAL_UNPIN=%s;\n"%("1" if self.opts.get("expunpin") else "0")
@@ -785,17 +921,39 @@ wait'''
                 self._teardown()
             self.want_running=True; self.cur_pkg=pkg; self._rapid=0; self._total_recov=0; self._strat=0; self._ssl_hooked=False
             self.status("starting","Starting %s…"%pkg)
+            self.log("[*] launch settings: mode=%s, native-only=%s, anti-detection=%s"%
+                     (self.opts.get("mode"),bool(self.opts.get("stealth")),bool(self.opts.get("antifrida"))))
+            if self._cancel_start.is_set() or not self._device_ready(s): return self._reset()
             if "uid=0" not in sush("id",s,to=15):
+                if not self._device_ready(s): return self._reset()
                 self.log("[!] device not rooted (su) — cannot intercept"); return self._reset()
-            if not self.ensure_frida(s): return self._reset()
-            if not self._setup_routing(pkg): return self._reset()
+            proxy_only=self.opts.get("mode")=="proxy"
+            if proxy_only:
+                pid=self._app_pid(pkg) or self._launch_and_get_pid(None,pkg)
+                if not pid:
+                    self.log("[!] app did not start for proxy-only capture"); return self._reset()
+                self.opts["mitmcap"]=True
+            elif not self.ensure_frida(s): return self._reset()
+            if self._cancel_start.is_set(): return self._reset()
             if self.opts.get("mitmcap"):
                 self._start_mitm()   # tool becomes the proxy
+                if not self._mitm: raise RuntimeError("Capture proxy could not start; device traffic has not been redirected.")
             elif not self._proxy_up():
                 self.log("[?] heads-up: nothing is listening on PC:%d yet — start Burp with an INVISIBLE listener on :%d, or requests will be refused."%(self.port,self.port))
-            if not self._inject(pkg): return self._reset()
+            if not self._setup_routing(pkg): return self._reset()
+            if self._cancel_start.is_set() or not self.want_running: return self._reset()
+            if proxy_only:
+                if not self._mitm or not self._install_app_ca(pid): return self._reset()
+                self.running=True; self._active_ts=time.time()
+                self.status("active","PROXY ONLY %s — no Frida attachment"%pkg)
+                self.log("[+] Proxy-only capture active: no Frida hooks. Certificate-pinned connections may still fail.")
+                threading.Thread(target=self._traffic_monitor,daemon=True).start()
+            elif not self._inject(pkg): return self._reset()
         except Exception as e:
             self.log("[!] failed: %s"%e); tlog(traceback.format_exc()); self._reset()
+
+        finally:
+            if self._start_lock.locked(): self._start_lock.release()
 
     def _diagnose(self,reason,dt):
         """Tell the user WHY it crashed and exactly which option to enable for this crash type."""
@@ -873,7 +1031,7 @@ wait'''
             pat=self._stealth_name if self.opts.get("stealth") else "frida-server"
             out=sush("pgrep -f %s 2>/dev/null | head -1"%pat,self.serial,to=8) or ""
             if not out.strip().split("\n")[0].strip().isdigit(): return False
-            (self._fdev or frida.get_usb_device(timeout=6)).enumerate_processes(); return True
+            (self._fdev or frida.get_device(self.serial,timeout=6)).enumerate_processes(); return True
         except Exception:
             return False
 
@@ -921,7 +1079,11 @@ wait'''
             self._recovering=False
 
     def _reset(self):
-        self.status("idle","Not intercepting."); self.running=False; self.want_running=False
+        self.running=False; self.want_running=False
+        if self.uid or self.session or self.srv or self._mitm:
+            self.log("[*] startup failed or was cancelled — restoring device routing")
+            self._teardown()
+        self.status("idle","Not intercepting — see the startup error in Activity.")
         return False
 
     # js_api: toggle crash auto-recovery from the UI
@@ -932,6 +1094,7 @@ wait'''
 
     # js_api: return immediately, do the teardown on a worker thread so the button can't freeze the UI
     def stop(self):
+        self._cancel_start.set()
         self.want_running=False   # cancel any in-flight auto-recovery
         threading.Thread(target=self._teardown,daemon=True).start()
         return {"ok":True}
@@ -950,11 +1113,17 @@ wait'''
         except Exception: pass
         s,route_port=getattr(self,"_routing_context",None) or (self.serial,self.port)
         try:
+            self._remove_app_ca()
             # 1) detach frida (removes all in-app hooks; pinning restored automatically)
-            try:
-                if self.session: self.session.detach()
-            except Exception as e: tlog("[!] detach: %s"%e)
-            self.session=None
+            session=self.session; self.session=None
+            if session:
+                def detach():
+                    try: session.detach()
+                    except Exception as e: tlog("[!] detach: %s"%e)
+                worker=threading.Thread(target=detach,daemon=True)
+                worker.start(); worker.join(3)
+                if worker.is_alive():
+                    self.log("[*] agent detach timed out — continuing routing cleanup and server shutdown")
             if s:
                 # 2) remove OUR rules for this uid (redirect + QUIC block + IPv6 force)
                 if self.uid:

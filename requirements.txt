@@ -1,4 +1,4 @@
-frida==17.9.10
+frida==17.23.3
 pywebview==6.2.1
 cryptography>=42.0
 brotli>=1.1.0          # decode br-encoded response bodies in the Requests tab (optional but common)

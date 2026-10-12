@@ -280,7 +280,7 @@ class MitmProxy:
         try:
             tls_client = ctx.wrap_socket(client, server_side=True)
         except Exception as e:
-            if self._debug: self.log("[mitm] client TLS handshake FAILED for %s: %s" % (host, e))
+            self.log("[!] capture: app TLS handshake failed for %s: %s (check proxy CA trust or certificate pinning)" % (host, e))
             client.close(); return
         client_alpn = ""
         try: client_alpn = tls_client.selected_alpn_protocol() or ""

@@ -275,7 +275,8 @@
         <div class="toggle on" id="sw_mitmcap" onclick="tog('mitmcap')" title="In-tool capture proxy: the tool decrypts traffic itself and shows ALL requests (incl. pure-Dart) in the Requests tab — no Burp needed. Uses the proxy port. ON by default so you get requests without Burp."><span class="tk"></span>Capture proxy</div>
         <div class="vline"></div>
         <span class="cfg-label">Mode</span>
-        <div class="seg" id="seg"><div class="on" data-m="spawn" onclick="setMode('spawn')">Spawn</div><div data-m="attach" onclick="setMode('attach')">Attach</div></div>
+        <button class="btn ghost" onclick="phonePreset()" title="Use native-only Attach mode on Android 16; Java root/VPN hooks are unavailable.">Android 16 preset</button>
+        <div class="seg" id="seg"><div class="on" data-m="spawn" onclick="setMode('spawn')">Spawn</div><div data-m="attach" onclick="setMode('attach')">Attach</div><div data-m="proxy" onclick="setMode('proxy')" title="Capture proxy with a temporary app CA overlay; no Frida hooks or pinning bypass.">Proxy only</div></div>
         <div class="vline"></div>
         <span class="cfg-label">Proxy</span>
         <div class="portbox"><span>PC :</span><input id="port" value="8080"></div>
@@ -411,12 +412,30 @@
     document.querySelectorAll('.nav a').forEach(x=>x.classList.toggle('on',x.dataset.v===v));
     document.querySelectorAll('.view').forEach(x=>x.classList.toggle('on',x.dataset.view===v));
   }
-  function tog(k){OPTS[k]=!OPTS[k]; $('sw_'+k).classList.toggle('on',OPTS[k]);}
+  function saveLaunchOptions(){try{localStorage.setItem('fiLaunchOptions',JSON.stringify(OPTS));}catch(e){}}
+  function restoreLaunchOptions(){
+    try{
+      var saved=JSON.parse(localStorage.getItem('fiLaunchOptions')||'{}');
+      Object.keys(OPTS).forEach(function(k){
+        if(k==='mode'){if(['spawn','attach','proxy'].includes(saved[k]))OPTS[k]=saved[k];}
+        else if(typeof saved[k]==='boolean')OPTS[k]=saved[k];
+      });
+    }catch(e){}
+    Object.keys(OPTS).forEach(function(k){if(k!=='mode'&&$('sw_'+k))$('sw_'+k).classList.toggle('on',OPTS[k]);});
+    document.querySelectorAll('#seg div').forEach(d=>d.classList.toggle('on',d.dataset.m===OPTS.mode));
+  }
+  restoreLaunchOptions();
+  function tog(k){OPTS[k]=!OPTS[k]; $('sw_'+k).classList.toggle('on',OPTS[k]);saveLaunchOptions();}
+  function phonePreset(){
+    Object.assign(OPTS,{mode:'attach',stealth:true,antifrida:false,root:false,vpn:false});
+    saveLaunchOptions();restoreLaunchOptions();
+    toast('Android 16 preset: Attach + native hooks; Java root/VPN hooks disabled','ok');
+  }
   var AUTO=true;
   function togAuto(){AUTO=!AUTO; $('sw_auto').classList.toggle('on',AUTO);
     if(window.pywebview&&window.pywebview.api.set_auto) window.pywebview.api.set_auto(AUTO);
     toast('Auto-recover '+(AUTO?'enabled':'disabled'));}
-  function setMode(m){OPTS.mode=m; document.querySelectorAll('#seg div').forEach(d=>d.classList.toggle('on',d.dataset.m===m));}
+  function setMode(m){OPTS.mode=m;if(m==='proxy'){OPTS.mitmcap=true;document.getElementById('sw_mitmcap').classList.add('on');}saveLaunchOptions(); document.querySelectorAll('#seg div').forEach(d=>d.classList.toggle('on',d.dataset.m===m));}
   function loading(on){$('hair').classList.toggle('load',on);}
 
   /* ----- toasts ----- */

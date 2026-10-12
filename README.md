@@ -59,6 +59,29 @@ target APK so you get traffic without a rooted device at all.
 
 ## 🌐 Getting the requests — three ways
 
+### Rooted Android 16: Proxy only and native Attach
+
+For apps that stop responding or close during Frida attachment, select **Proxy only**
+and leave **Capture proxy** enabled. This starts the built-in proxy without Frida
+provisioning, attachment, or hooks. It still requires root for per-app traffic routing
+and certificate installation. SSL unpinning, root/VPN bypass, and anti-detection toggles
+do not run in this mode; certificate-pinned connections can still fail.
+
+On read-only Android trust stores, the tool preserves the existing CA certificates and
+binds a temporary copy containing its proxy CA into the target app's mount namespace.
+It verifies the CA through the app's trust-store path and removes the tracked mount on
+Stop. Temporary certificate-copy directories remain under `/data/local/tmp`; no permanent
+root-manager module is installed. If removal fails, the Activity log reports it.
+
+For Frida capture on Android 16, **Android 16 preset** selects Attach with native-only
+hooks and disables Java root/VPN hooks and anti-detection. Open the app normally before
+attaching. This avoids the Java-bridge timeout observed on the tested device but does
+not guarantee compatibility with every app. Launch settings persist between runs.
+
+Frida is pinned to **17.23.3**. Provisioning reuses cached binaries, reports download
+progress, and distinguishes an unavailable ADB connection from a failed root check.
+TLS handshake failures now appear in Activity rather than being silently hidden.
+
 ### A) reFlutter chain → Burp (no root needed) — newest
 1. In the **Intercept** tab config strip, type the app's package name (or scan & use an app card)
    and click **🔧 Build patched APK**.
